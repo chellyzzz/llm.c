@@ -316,6 +316,15 @@ __global__ void gelu_forward_kernel(float* out, const float* inp, int N) {
     }
 }
 
+__global__ void add_bias_kernel(float* out, const float* bias, int M, int OC) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < M * OC; i += stride) {
+        int col = i % OC;
+        out[i] += bias[col];
+    }
+}
+
 __global__ void gelu_backward_kernel(float* dinp, const float* inp, const float* dout, const int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
@@ -721,18 +730,21 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
-// kernel 1 is the most naive matmul kernel
 void matmul_forward(float* out,
                     const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    int sqrt_block_size = 16;
-
-    dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
-    dim3 blockDim(sqrt_block_size, sqrt_block_size);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
-    cudaCheck(cudaGetLastError());
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    // forward pass: out = inp @ weight^T
+    cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &one, weight, C, inp, C, &zero, out, OC));
+    // add bias if given
+    if (bias != NULL) {
+        const int block_size = 1024;
+        int total = B * T * OC;
+        int grid = CEIL_DIV(total, block_size);
+        add_bias_kernel<<<grid, block_size>>>(out, bias, B * T, OC);
+        cudaCheck(cudaGetLastError());
+    }
 }
 
 void attention_forward(float* out, float* qkvr, float* att,
