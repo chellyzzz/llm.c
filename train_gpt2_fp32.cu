@@ -614,79 +614,6 @@ __device__ void st_vec(float* address, float4 val) {
     *reinterpret_cast<float4*>(address) = val;
 }
 
-__global__ void __launch_bounds__(16*16, 2) matmul_forward_kernel4(float* out,
-                                                                   const float* inp, const float* weight, const float* bias,
-                                                                   int C, int OC) {
-    // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
-    // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    // each thread handles 8x8 elements; each block 128 by 128 elements.
-    int oc = 8*(blockIdx.y * blockDim.y + threadIdx.y);
-
-    // buffers to cache chunks of the input matrices
-    __shared__ float lhs_s[128][32];
-    __shared__ float rhs_s[128][32];
-
-    // adjust our pointers for the current block
-    inp += 128 * blockIdx.x * C;
-    weight += 128 * blockIdx.y * C;
-    out += 128 * blockIdx.x * OC + 128 * blockIdx.y;
-
-    float vals[8][8] = {};
-    if(bias != NULL) {
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j += 4) {
-                float4 b = ld_vec(bias + oc + j);
-                vals[i][j+0] = b.x;
-                vals[i][j+1] = b.y;
-                vals[i][j+2] = b.z;
-                vals[i][j+3] = b.w;
-            }
-        }
-    }
-
-    int si_start = 4*(16 * threadIdx.y + threadIdx.x);
-    for (int so = 0; so < C; so += 32) {
-        __syncthreads();
-        int xmod8 = threadIdx.x % 8;
-        int xby8 = threadIdx.x / 8;
-        int xo = 4 * xmod8;
-        for(int y = 2 * threadIdx.y + xby8; y < 128; y += 32) {
-            st_vec(&lhs_s[y][xo], ld_vec(inp + y * C + so + xo));
-            st_vec(&rhs_s[y][xo], ld_vec(weight + y * C + so + xo));
-        }
-        __syncthreads();
-
-        for (int si = si_start; si < si_start + 32; si += 4) {
-            float4 rhs[8];
-            for (int u = 0; u < 8; ++u) {
-                rhs[u] = ld_vec(&rhs_s[u + 8 * threadIdx.y][si % 32]);
-            }
-
-            for (int ii = 0; ii < 8; ++ii) {
-                float4 lhs = ld_vec(&lhs_s[ii + 8 * threadIdx.x][si % 32]);
-                for (int ji = 0; ji < 8; ++ji) {
-                    vals[ii][ji] += lhs.x * rhs[ji].x;
-                    vals[ii][ji] += lhs.y * rhs[ji].y;
-                    vals[ii][ji] += lhs.z * rhs[ji].z;
-                    vals[ii][ji] += lhs.w * rhs[ji].w;
-                }
-            }
-        }
-    }
-
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; j += 4) {
-            float4 result;
-            result.x = vals[i][j + 0];
-            result.y = vals[i][j + 1];
-            result.z = vals[i][j + 2];
-            result.w = vals[i][j + 3];
-            st_vec(out + (8*threadIdx.x+i) * OC + 8*threadIdx.y + j, result);
-        }
-    }
-}
-
-
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -722,17 +649,97 @@ void layernorm_forward(float* out, float* mean, float* rstd,
 }
 
 // kernel 1 is the most naive matmul kernel
+// matmul forward pass using cuBLASLt with bias fusion support
 void matmul_forward(float* out,
                     const float* inp, const float* weight, const float* bias,
                     int B, int T, int C, int OC) {
     // out is (B,T,OC). OC is short for "output channels", e.g. OC = 4 * C
     // inp is (B,T,C), weight is (OC, C), bias is (OC)
-    int sqrt_block_size = 16;
+    
+    // Configuration flags
+    const int has_bias = (bias != NULL);
+    const int has_gelu = 0;  // GELU fusion disabled for this implementation
 
-    dim3 gridDim(CEIL_DIV(B * T, 8*sqrt_block_size), CEIL_DIV(OC, 8*sqrt_block_size));
-    dim3 blockDim(sqrt_block_size, sqrt_block_size);
-    matmul_forward_kernel4<<<gridDim, blockDim>>>(out, inp, weight, bias, C, OC);
-    cudaCheck(cudaGetLastError());
+    // Validate bias pointer alignment (required by cuBLASLt)
+    if(has_bias && ((uintptr_t)bias % 16) != 0) {
+        printf("Error: Bias pointer must be 16-byte aligned for cuBLASLt!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Setup cuBLASLt operation descriptors and layouts
+    cublasLtMatmulDesc_t operationDesc;
+    cublasLtMatmulPreference_t preference;
+    cublasLtMatrixLayout_t weightLayout, inputLayout, outputLayout, biasLayout;
+    cublasLtMatmulHeuristicResult_t heuristic;
+    int returnedResults = 0;
+
+    // Configure the epilogue based on fusion options
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+    if (has_bias && has_gelu) {
+        epilogue = CUBLASLT_EPILOGUE_GELU_BIAS;
+    } else if (has_bias) {
+        epilogue = CUBLASLT_EPILOGUE_BIAS;
+    } else if (has_gelu) {
+        epilogue = CUBLASLT_EPILOGUE_GELU;
+    }
+
+    // Create operation descriptor with FP32 compute type
+    cublasCheck(cublasLtMatmulDescCreate(&operationDesc, cublas_compute_type, CUDA_R_32F));
+    
+    // Set transpose operations: weight needs transpose, input does not
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasOperation_t no_transpose = CUBLAS_OP_N;
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, 
+                                               &transpose, sizeof(transpose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, 
+                                               &no_transpose, sizeof(no_transpose)));
+    
+    // Configure epilogue and bias pointer
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, 
+                                               &epilogue, sizeof(epilogue)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, 
+                                               &bias, sizeof(bias)));
+
+    // Create matrix layouts for all tensors
+    // weight: (C, OC), input: (C, B*T), output: (OC, B*T), bias: (OC, 1)
+    cublasCheck(cublasLtMatrixLayoutCreate(&weightLayout, CUDA_R_32F, C, OC, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&inputLayout, CUDA_R_32F, C, B*T, C));
+    cublasCheck(cublasLtMatrixLayoutCreate(&outputLayout, CUDA_R_32F, OC, B*T, OC));
+    cublasCheck(cublasLtMatrixLayoutCreate(&biasLayout, CUDA_R_32F, OC, 1, OC));
+
+    // Configure workspace preference
+    cublasCheck(cublasLtMatmulPreferenceCreate(&preference));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(preference,
+                                                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                    &cublaslt_workspace_size, 
+                                                    sizeof(cublaslt_workspace_size)));
+
+    // Query for optimal algorithm
+    cublasCheck(cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc,
+                                               weightLayout, inputLayout, outputLayout, outputLayout,
+                                               preference, 1, &heuristic, &returnedResults));
+    
+    if (returnedResults == 0) {
+        printf("cuBLASLt failed to find algorithm for: B=%d, T=%d, C=%d, OC=%d, bias=%d, gelu=%d\n",
+               B, T, C, OC, has_bias, has_gelu);
+        exit(EXIT_FAILURE);
+    }
+
+    // Execute the matrix multiplication
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc,
+                               &alpha, weight, weightLayout, inp, inputLayout, 
+                               &beta, out, outputLayout, out, outputLayout, 
+                               &heuristic.algo, cublaslt_workspace, cublaslt_workspace_size, 0));
+
+    // Cleanup resources
+    cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
+    cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+    cublasCheck(cublasLtMatrixLayoutDestroy(weightLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(inputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(outputLayout));
+    cublasCheck(cublasLtMatrixLayoutDestroy(biasLayout));
 }
 
 void attention_forward(float* out, float* qkvr, float* att,
