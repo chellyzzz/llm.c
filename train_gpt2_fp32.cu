@@ -22,6 +22,7 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 
 // GPU / CUDA related
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -61,6 +62,9 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
+cublasLtHandle_t cublaslt_handle;
+void* cublaslt_workspace = NULL;
+size_t cublaslt_workspace_size = 32 * 1024 * 1024; // 32MB
 
 namespace cg = cooperative_groups;
 
@@ -1618,6 +1622,8 @@ int main(int argc, char *argv[]) {
     cudaGetDeviceProperties(&deviceProp, deviceIdx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
+    cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
@@ -1754,6 +1760,8 @@ int main(int argc, char *argv[]) {
     gpt2_free(&model);
     free(cpu_logits);
     free(gen_tokens);
+    cudaCheck(cudaFree(cublaslt_workspace));
+    cublasCheck(cublasLtDestroy(cublaslt_handle));
     cublasCheck(cublasDestroy(cublas_handle));
     logger_free(&logger);
 
